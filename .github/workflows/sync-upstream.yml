@@ -1,0 +1,76 @@
+name: Sync from upstream
+
+on:
+  schedule:
+    # Check for upstream updates every 6 hours
+    - cron: "0 */6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Add upstream remote
+        run: |
+          git remote add upstream https://github.com/openclaw/openclaw.git || true
+          git fetch upstream main
+
+      - name: Check for new upstream commits
+        id: check
+        run: |
+          BEHIND=$(git rev-list --count HEAD..upstream/main)
+          echo "behind=$BEHIND" >> "$GITHUB_OUTPUT"
+          echo "Upstream is $BEHIND commits ahead"
+
+      - name: Rebase fork onto upstream (preserving our commits)
+        if: steps.check.outputs.behind != '0'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # Try rebase first (cleanest history)
+          if git rebase upstream/main; then
+            echo "REBASE_OK=true" >> "$GITHUB_ENV"
+          else
+            git rebase --abort
+            echo "REBASE_OK=false" >> "$GITHUB_ENV"
+          fi
+
+      - name: Push rebased changes
+        if: steps.check.outputs.behind != '0' && env.REBASE_OK == 'true'
+        run: git push --force-with-lease origin main
+
+      - name: Create PR on conflict (merge fallback)
+        if: steps.check.outputs.behind != '0' && env.REBASE_OK == 'false'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          BRANCH="auto-sync/upstream-$(date +%Y%m%d-%H%M)"
+          git checkout -b "$BRANCH" upstream/main
+
+          git push origin "$BRANCH"
+
+          gh pr create \
+            --title "Auto-sync: upstream openclaw/openclaw updates (conflict)" \
+            --body "Automatic rebase failed due to conflicts with our custom config.
+
+          **Action needed**: merge this branch manually, resolving conflicts in:
+          - \`Dockerfile\`
+          - \`docker-entrypoint.sh\`
+
+          Upstream is ${{ steps.check.outputs.behind }} commits ahead." \
+            --base main \
+            --head "$BRANCH"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
